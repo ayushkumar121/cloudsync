@@ -60,7 +60,7 @@ pub fn sync(args: &Vec<String>) -> Result<(), String> {
     let config_data = std::fs::read_to_string(config_path)
         .map_err(|err| format!("Cannot read config: {}", err))?;
 
-    let mut config: Config = serde_json::from_str(&config_data.as_str())
+    let mut config: Config = serde_json::from_str(config_data.as_str())
         .map_err(|err| format!("Cannot read config: {}", err))?;
 
     if let Some(account) = config.accounts.get_mut(account_name) {
@@ -137,7 +137,7 @@ fn config_path() -> String {
     format!("{home}/.config/cloudsync.json")
 }
 
-fn save_account(account_name: &String, account: &Account) -> Result<(), String> {
+fn save_account(account_name: &str, account: &Account) -> Result<(), String> {
     let config_path = config_path();
     let mut config_file = std::fs::File::options()
         .read(true)
@@ -151,7 +151,7 @@ fn save_account(account_name: &String, account: &Account) -> Result<(), String> 
         .read_to_string(&mut config_data)
         .map_err(|err| format!("Cannot read config file: {}", err))?;
 
-    let mut config = match serde_json::from_str::<Config>(&config_data.as_str()) {
+    let mut config = match serde_json::from_str::<Config>(config_data.as_str()) {
         Ok(config) => config,
         Err(_) => Config {
             accounts: HashMap::new(),
@@ -160,7 +160,7 @@ fn save_account(account_name: &String, account: &Account) -> Result<(), String> 
 
     config
         .accounts
-        .insert(account_name.clone(), account.clone());
+        .insert(account_name.to_owned(), account.clone());
     config_data = serde_json::to_string(&config).unwrap();
 
     config_file
@@ -206,7 +206,7 @@ fn download_file(parent: &String, file: &CloudFile) -> Result<(), String> {
 }
 
 fn sync_files(
-    account_name: &String,
+    account_name: &str,
     account: &mut Account,
     folder_path: &String,
 ) -> Result<(), String> {
