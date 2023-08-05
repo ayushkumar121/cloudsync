@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use curl::easy::{Easy, Form, List};
 use serde::{Deserialize, Serialize};
 
-use crate::{Account, CloudFile, Token};
+use crate::{urlencode, Account, CloudFile, DriveDelta, DriveDeltaType, Token};
 
 const CLIENT_ID: &str = "3dceca68-abd4-46a1-9e72-9dda8a80d9c1";
 const REDIRECT_URL: &str = "https://login.microsoftonline.com/common/oauth2/nativeclient";
@@ -35,6 +35,9 @@ struct ParentReference {
     path: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Deleted {}
+
 #[allow(non_snake_case)]
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct OneDriveItem {
@@ -42,11 +45,12 @@ struct OneDriveItem {
     name: String,
     size: u32,
     webUrl: String,
+    parentReference: ParentReference,
     createdDateTime: Option<String>,
     lastModifiedDateTime: Option<String>,
     file: Option<FileProperties>,
     folder: Option<FolderProperties>,
-    parentReference: ParentReference,
+    deleted: Option<Deleted>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -58,8 +62,7 @@ struct OneDriveListItems {
     delta_link: Option<String>,
     value: Vec<OneDriveItem>,
 }
-
-fn get_delta(account: &mut Account, delta_link: &str, items: &mut Vec<OneDriveItem>) {
+fn get_delta(account: &mut Account, api_url: &str, items: &mut Vec<OneDriveItem>) {
     let mut headers = List::new();
     headers
         .append(format!("Authorization:Bearer {}", account.token.access_token).as_str())
@@ -68,7 +71,7 @@ fn get_delta(account: &mut Account, delta_link: &str, items: &mut Vec<OneDriveIt
     let mut handle = Easy::new();
     let mut response_body = Vec::new();
 
-    handle.url(delta_link).unwrap();
+    handle.url(api_url).unwrap();
     handle.http_headers(headers).unwrap();
     {
         let mut transfer = handle.transfer();
@@ -96,7 +99,37 @@ fn get_delta(account: &mut Account, delta_link: &str, items: &mut Vec<OneDriveIt
     }
 }
 
-pub fn get_drive_delta(account: &mut Account) -> Result<Vec<CloudFile>, String> {
+pub fn download_file(account: &Account, item_path: &str) -> String {
+    let mut headers = List::new();
+    headers
+        .append(format!("Authorization:Bearer {}", account.token.access_token).as_str())
+        .unwrap();
+
+    let item_path_escaped = urlencode(item_path);
+    let api_url = format!(
+        "https://login.microsoftonline.com/v1.0/me/drive/root:/{}:/content",
+        item_path_escaped
+    );
+    let mut handle = Easy::new();
+    let mut response_body = Vec::new();
+
+    handle.url(&api_url).unwrap();
+    handle.http_headers(headers).unwrap();
+    {
+        let mut transfer = handle.transfer();
+        transfer
+            .write_function(|data| {
+                response_body.extend_from_slice(data);
+                Ok(data.len())
+            })
+            .unwrap();
+        transfer.perform().unwrap();
+    }
+
+    String::from_utf8_lossy(response_body.as_slice()).to_string()
+}
+
+pub fn get_drive_delta(account: &mut Account) -> Result<Vec<DriveDelta>, String> {
     let mut files = Vec::new();
     let root_delta_link = "https://graph.microsoft.com/v1.0/me/drive/root/delta".to_string();
 
@@ -115,10 +148,19 @@ pub fn get_drive_delta(account: &mut Account) -> Result<Vec<CloudFile>, String> 
         }
 
         if let Some(mut parent) = file.parentReference.path {
-            let folder = parent.split_off(12);
-            let file_name = file.name;
+            let folder = parent.split_off(13);
+            let file_path = format!("{}/{}", folder, file.name);
 
-            cloud_files.push(CloudFile { folder, file_name });
+            cloud_files.push(DriveDelta {
+                file: CloudFile {
+                    file_path,
+                    last_modified: 0,
+                },
+                delta_type: match file.deleted {
+                    Some(_) => DriveDeltaType::Deleted,
+                    None => DriveDeltaType::CreatedOrModifiled,
+                },
+            });
         }
     }
 
@@ -160,11 +202,11 @@ pub fn get_token(code: &str, grant_type: &str) -> Result<Token, String> {
         _ => return Err("Invalid grant_type".to_string()),
     };
 
-    let token_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
+    let api_url = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
     let mut handle = Easy::new();
     let mut response_body = Vec::new();
 
-    handle.url(token_url).unwrap();
+    handle.url(api_url).unwrap();
     handle.httppost(form).unwrap();
     {
         let mut transfer = handle.transfer();

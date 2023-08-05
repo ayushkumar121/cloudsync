@@ -24,12 +24,29 @@ pub struct Token {
     pub valid_till: u64,
 }
 
+pub enum DriveDeltaType {
+    Deleted,
+    CreatedOrModifiled,
+}
+
+pub struct DriveDelta {
+    file: CloudFile,
+    delta_type: DriveDeltaType,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CloudFile {
+    pub file_path: String,
+    pub last_modified: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Account {
     pub service: SyncService,
     pub token: Token,
 
     // Storing last sync information
+    pub files: Vec<CloudFile>,
     pub last_synced: u64,
     pub attributes: HashMap<String, String>,
 }
@@ -37,6 +54,10 @@ pub struct Account {
 #[derive(Serialize, Deserialize)]
 struct Config {
     accounts: HashMap<String, Account>,
+}
+
+pub fn urlencode(data: &str) -> String {
+    data.replace(" ", "%20")
 }
 
 // Assuming args
@@ -64,7 +85,7 @@ pub fn sync(args: &Vec<String>) -> Result<(), String> {
         .map_err(|err| format!("Cannot read config: {}", err))?;
 
     if let Some(account) = config.accounts.get_mut(account_name) {
-        sync_files(account_name, account, &folder_path_str)?;
+        sync_files(account, account_name, &folder_path_str)?;
     } else {
         return Err("Unknown account name please login first".to_string());
     }
@@ -122,6 +143,7 @@ pub fn save(args: &Vec<String>) -> Result<(), String> {
         service: SyncService::Onedrive,
         token,
         last_synced: 0,
+        files: Vec::new(),
         attributes: HashMap::new(),
     };
 
@@ -137,6 +159,8 @@ fn config_path() -> String {
     format!("{home}/.config/cloudsync.json")
 }
 
+// NOTE: We're cloning the entire account struct
+// So this will be a costly operation
 fn save_account(account_name: &str, account: &Account) -> Result<(), String> {
     let config_path = config_path();
     let mut config_file = std::fs::File::options()
@@ -181,62 +205,80 @@ fn refresh_token(account: &mut Account) -> Result<(), String> {
     account.token = token;
     Ok(())
 }
+fn sync_remote_file(account: &Account, parent: &String, delta: &DriveDelta) -> Result<(), String> {
+    let (folder, _) = delta.file.file_path.rsplit_once("/").unwrap();
+    let full_file_path = format!("{}/{}", parent, delta.file.file_path);
 
-#[derive(Debug)]
-pub struct CloudFile {
-    pub folder: String,
-    pub file_name: String,
-}
+    match delta.delta_type {
+        DriveDeltaType::Deleted => {
+            std::fs::remove_file(full_file_path)
+                .map_err(|err| format!("Cannot delete file: {}", err))?;
+            println!("INFO: Deleting {}", delta.file.file_path);
+        }
+        DriveDeltaType::CreatedOrModifiled => {
+            println!("{}", delta.file.file_path);
 
-fn download_file(parent: &String, file: &CloudFile) -> Result<(), String> {
-    let full_folder_path = format!("{}{}", parent, file.folder);
-    std::fs::create_dir_all(&full_folder_path)
-        .map_err(|err| format!("Cannot create folder: {}", err))?;
+            let full_folder_path = format!("{}/{}", parent, folder);
+            std::fs::create_dir_all(&full_folder_path)
+                .map_err(|err| format!("Cannot create folder: {}", err))?;
 
-    let full_file_path = format!("{}/{}", full_folder_path, file.file_name);
+            let file_contents = match account.service {
+                SyncService::GDrive => todo!(),
+                SyncService::Onedrive => onedrive::download_file(account, &delta.file.file_path),
+            };
 
-    // TODO: Download actual file
-    std::fs::File::options()
-        .write(true)
-        .create(true)
-        .open(full_file_path)
-        .map_err(|err| format!("Cannot create file: {}", err))?;
+            std::fs::write(full_file_path, file_contents)
+                .map_err(|err| format!("Cannot create file: {}", err))?;
+        }
+    }
 
     Ok(())
 }
 
 fn sync_files(
-    account_name: &str,
     account: &mut Account,
+    account_name: &str,
     folder_path: &String,
 ) -> Result<(), String> {
+    println!("Syncing {} to {}", folder_path, account_name);
+
     let start = SystemTime::now();
-    let since_the_epoch = start
+    let now = start
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_secs();
 
-    if since_the_epoch > account.token.valid_till {
+    if now > account.token.valid_till {
         refresh_token(account)?;
     }
 
-    let files = match account.service {
+    let deltas = match account.service {
         SyncService::GDrive => todo!(),
         SyncService::Onedrive => onedrive::get_drive_delta(account)?,
     };
 
-    // TODO: Download all files
-    for file in files {
-        if let Err(err) = download_file(folder_path, &file) {
-            println!(
-                "\nERROR: Cannot sync file : {}/{} :\n{}",
-                file.folder, file.file_name, err
-            );
+    println!("INFO: Resolving deltas {}", deltas.len());
+
+    // Download all server changes
+    for delta in &deltas {
+        if let Err(err) = sync_remote_file(account, folder_path, &delta) {
+            eprintln!("ERROR: Cannot sync file: {}", err);
         }
     }
 
-    // TODO: Upload local files
+    // TODO: Upload all local changes
 
+    // Files after sync
+    let mut files = Vec::new();
+    for delta in &deltas {
+        match delta.delta_type {
+            DriveDeltaType::CreatedOrModifiled => files.push(delta.file.clone()),
+            _ => {}
+        }
+    }
+
+    account.files = files;
+    account.last_synced = now;
     save_account(account_name, account)?;
 
     Ok(())
