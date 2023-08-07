@@ -159,6 +159,26 @@ pub fn upload_new_file(account: &Account, item_path: &str, mut contents: &[u8]) 
     }
 }
 
+pub fn delete_file(account: &Account, item_path: &str) {
+    let mut headers = List::new();
+    headers
+        .append(format!("Authorization:Bearer {}", account.token.access_token).as_str())
+        .unwrap();
+    headers.append("Content-Type: text/plain").unwrap();
+
+    let item_path_escaped = urlencode(item_path);
+    let api_url = format!(
+        "https://graph.microsoft.com/v1.0/me/drive/root:{}:/content",
+        item_path_escaped
+    );
+    let mut handle = Easy::new();
+
+    handle.url(&api_url).unwrap();
+    handle.http_headers(headers).unwrap();
+    handle.custom_request("DELETE").unwrap();
+    handle.perform().unwrap();
+}
+
 pub fn get_drive_delta(account: &mut Account) -> Result<Vec<DriveDelta>, String> {
     let mut files = Vec::new();
     let root_delta_link = "https://graph.microsoft.com/v1.0/me/drive/root/delta".to_string();
