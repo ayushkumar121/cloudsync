@@ -1,9 +1,12 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    io::Read,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use curl::easy::{Easy, Form, List};
 use serde::{Deserialize, Serialize};
 
-use crate::{urlencode, Account, CloudFile, DriveDelta, DriveDeltaType, Token};
+use crate::{parse_iso_date, urlencode, Account, DriveDelta, DriveDeltaType, Token, TrackedFile};
 
 const CLIENT_ID: &str = "3dceca68-abd4-46a1-9e72-9dda8a80d9c1";
 const REDIRECT_URL: &str = "https://login.microsoftonline.com/common/oauth2/nativeclient";
@@ -43,9 +46,9 @@ struct Deleted {}
 struct OneDriveItem {
     id: String,
     name: String,
-    size: u32,
     webUrl: String,
     parentReference: ParentReference,
+    size: Option<u32>,
     createdDateTime: Option<String>,
     lastModifiedDateTime: Option<String>,
     file: Option<FileProperties>,
@@ -107,13 +110,14 @@ pub fn download_file(account: &Account, item_path: &str) -> String {
 
     let item_path_escaped = urlencode(item_path);
     let api_url = format!(
-        "https://login.microsoftonline.com/v1.0/me/drive/root:/{}:/content",
+        "https://graph.microsoft.com/v1.0/me/drive/root:/{}:/content",
         item_path_escaped
     );
     let mut handle = Easy::new();
     let mut response_body = Vec::new();
 
     handle.url(&api_url).unwrap();
+    handle.follow_location(true).unwrap();
     handle.http_headers(headers).unwrap();
     {
         let mut transfer = handle.transfer();
@@ -127,6 +131,32 @@ pub fn download_file(account: &Account, item_path: &str) -> String {
     }
 
     String::from_utf8_lossy(response_body.as_slice()).to_string()
+}
+
+pub fn upload_new_file(account: &Account, item_path: &str, mut contents: &[u8]) {
+    let mut headers = List::new();
+    headers
+        .append(format!("Authorization:Bearer {}", account.token.access_token).as_str())
+        .unwrap();
+    headers.append("Content-Type: text/plain").unwrap();
+
+    let item_path_escaped = urlencode(item_path);
+    let api_url = format!(
+        "https://graph.microsoft.com/v1.0/me/drive/root:{}:/content",
+        item_path_escaped
+    );
+    let mut handle = Easy::new();
+
+    handle.url(&api_url).unwrap();
+    handle.http_headers(headers).unwrap();
+    handle.put(true).unwrap();
+    {
+        let mut transfer = handle.transfer();
+        transfer
+            .read_function(|into| Ok(contents.read(into).unwrap()))
+            .unwrap();
+        transfer.perform().unwrap();
+    }
 }
 
 pub fn get_drive_delta(account: &mut Account) -> Result<Vec<DriveDelta>, String> {
@@ -143,18 +173,20 @@ pub fn get_drive_delta(account: &mut Account) -> Result<Vec<DriveDelta>, String>
 
     let mut cloud_files = Vec::new();
     for file in files {
-        if file.folder.is_some() {
+        // Skip anything that isn't a file
+        if file.file.is_none() {
             continue;
         }
 
         if let Some(mut parent) = file.parentReference.path {
-            let folder = parent.split_off(13);
+            let folder = parent.split_off(12);
             let file_path = format!("{}/{}", folder, file.name);
+            let last_modified = parse_iso_date(&file.lastModifiedDateTime.unwrap());
 
             cloud_files.push(DriveDelta {
-                file: CloudFile {
+                file: TrackedFile {
                     file_path,
-                    last_modified: 0,
+                    last_modified,
                 },
                 delta_type: match file.deleted {
                     Some(_) => DriveDeltaType::Deleted,

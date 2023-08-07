@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     io::Read,
+    io::{Seek, Write},
     os::unix::prelude::FileExt,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -30,12 +31,12 @@ pub enum DriveDeltaType {
 }
 
 pub struct DriveDelta {
-    file: CloudFile,
+    file: TrackedFile,
     delta_type: DriveDeltaType,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct CloudFile {
+#[derive(Clone)]
+pub struct TrackedFile {
     pub file_path: String,
     pub last_modified: u64,
 }
@@ -45,8 +46,6 @@ pub struct Account {
     pub service: SyncService,
     pub token: Token,
 
-    // Storing last sync information
-    pub files: Vec<CloudFile>,
     pub last_synced: u64,
     pub attributes: HashMap<String, String>,
 }
@@ -70,8 +69,8 @@ pub fn sync(args: &Vec<String>) -> Result<(), String> {
     let folder = &args[2];
     let account_name = &args[3];
 
-    let folder_path =
-        std::fs::canonicalize(folder).map_err(|err| format!("Invalid path: {}", err))?;
+    let folder_path = std::fs::canonicalize(folder)
+        .map_err(|err| format!("Cannot sync to {} because: {}", folder, err))?;
 
     // TODO: check if folder is valid folder
 
@@ -143,7 +142,6 @@ pub fn save(args: &Vec<String>) -> Result<(), String> {
         service: SyncService::Onedrive,
         token,
         last_synced: 0,
-        files: Vec::new(),
         attributes: HashMap::new(),
     };
 
@@ -205,50 +203,48 @@ fn refresh_token(account: &mut Account) -> Result<(), String> {
     account.token = token;
     Ok(())
 }
-fn sync_remote_file(account: &Account, parent: &String, delta: &DriveDelta) -> Result<(), String> {
-    let (folder, _) = delta.file.file_path.rsplit_once("/").unwrap();
-    let full_file_path = format!("{}/{}", parent, delta.file.file_path);
 
-    match delta.delta_type {
-        DriveDeltaType::Deleted => {
-            std::fs::remove_file(full_file_path)
-                .map_err(|err| format!("Cannot delete file: {}", err))?;
-            println!("INFO: Deleting {}", delta.file.file_path);
-        }
-        DriveDeltaType::CreatedOrModifiled => {
-            println!("{}", delta.file.file_path);
+// Recursively walk through
+fn read_dir_rec(folder: &str, files: &mut HashMap<String, u64>) -> std::io::Result<()> {
+    let dir_entries = std::fs::read_dir(folder)?;
 
-            let full_folder_path = format!("{}/{}", parent, folder);
-            std::fs::create_dir_all(&full_folder_path)
-                .map_err(|err| format!("Cannot create folder: {}", err))?;
+    for entry in dir_entries {
+        if let Ok(entry) = entry {
+            let metadata = entry.metadata()?;
+            let file_path = entry.path();
 
-            let file_contents = match account.service {
-                SyncService::GDrive => todo!(),
-                SyncService::Onedrive => onedrive::download_file(account, &delta.file.file_path),
-            };
+            if metadata.is_dir() {
+                read_dir_rec(file_path.to_str().unwrap(), files)?;
+            } else {
+                let last_modified = metadata
+                    .modified()?
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
 
-            std::fs::write(full_file_path, file_contents)
-                .map_err(|err| format!("Cannot create file: {}", err))?;
+                files.insert(file_path.to_str().unwrap().to_owned(), last_modified);
+            }
         }
     }
 
     Ok(())
 }
 
+fn timestamp() -> u64 {
+    let start = SystemTime::now();
+    start.duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
 fn sync_files(
     account: &mut Account,
     account_name: &str,
-    folder_path: &String,
+    folder_to_sync: &String,
 ) -> Result<(), String> {
-    println!("Syncing {} to {}", folder_path, account_name);
+    println!("Syncing {} to {}", folder_to_sync, account_name);
 
-    let start = SystemTime::now();
-    let now = start
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_secs();
-
+    let now = timestamp();
     if now > account.token.valid_till {
+        println!("INFO: Token refreshed");
         refresh_token(account)?;
     }
 
@@ -257,29 +253,226 @@ fn sync_files(
         SyncService::Onedrive => onedrive::get_drive_delta(account)?,
     };
 
-    println!("INFO: Resolving deltas {}", deltas.len());
+    println!("INFO: Reading existing cloudlist");
 
-    // Download all server changes
-    for delta in &deltas {
-        if let Err(err) = sync_remote_file(account, folder_path, &delta) {
-            eprintln!("ERROR: Cannot sync file: {}", err);
+    // Creating a scope so file is closed
+    {
+        let cloudfiles_file_path = format!("{}/.cloudfiles", folder_to_sync);
+        let mut cloudfiles_file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(cloudfiles_file_path)
+            .map_err(|err| err.to_string())?;
+
+        let mut cloudfiles_file_contents = String::new();
+        cloudfiles_file
+            .read_to_string(&mut cloudfiles_file_contents)
+            .map_err(|err| err.to_string())?;
+
+        let mut cloudfiles = HashMap::new();
+
+        let cloudfiles_file_lines = cloudfiles_file_contents.lines();
+        for line in cloudfiles_file_lines {
+            let (last_modified_str, file_path) = match line.split_once(':') {
+                Some(pair) => pair,
+                None => {
+                    return Err(
+                        "Incorrect .cloudfile please resync this folder from start".to_string()
+                    )
+                }
+            };
+
+            let last_modified: u64 = last_modified_str
+                .parse()
+                .map_err(|err| format!("Unknown config format {}", err))?;
+
+            cloudfiles.insert(file_path.to_string(), last_modified);
+        }
+
+        // Getting local changes
+        let mut local_files = HashMap::new();
+        read_dir_rec(&folder_to_sync, &mut local_files)
+            .map_err(|err| format!("Cannot walk folder to sync: {}", err))?;
+
+        let mut downloaded_count = 0;
+        let mut uploaded_count = 0;
+
+        // Getting cloud changes
+        for delta in &deltas {
+            // Skip the cloud sync request if
+            if account.last_synced >= delta.file.last_modified {
+                continue;
+            }
+
+            let (folder, _) = delta.file.file_path.rsplit_once("/").unwrap();
+            let full_file_path = format!("{}{}", folder_to_sync, delta.file.file_path);
+            let local_modified = local_files.get(&full_file_path).map_or(0, |val| *val);
+
+            match delta.delta_type {
+                DriveDeltaType::Deleted => {
+                    if delta.file.last_modified > local_modified {
+                        std::fs::remove_file(&full_file_path).map_err(|err| err.to_string())?;
+                        println!("INFO: Deleted {}", delta.file.file_path);
+                    }
+
+                    cloudfiles.remove(&full_file_path);
+                }
+                DriveDeltaType::CreatedOrModifiled => {
+                    if delta.file.last_modified > local_modified {
+                        let full_folder_path = format!("{}/{}", folder_to_sync, folder);
+                        std::fs::create_dir_all(&full_folder_path)
+                            .map_err(|err| err.to_string())?;
+
+                        let file_contents = match account.service {
+                            SyncService::GDrive => todo!(),
+                            SyncService::Onedrive => {
+                                onedrive::download_file(account, &delta.file.file_path)
+                            }
+                        };
+
+                        std::fs::write(&full_file_path, file_contents)
+                            .map_err(|err| err.to_string())?;
+
+                        println!("INFO: Downloaded {}", delta.file.file_path);
+                        downloaded_count += 1;
+
+                        cloudfiles.insert(full_file_path, timestamp());
+                    } else {
+                        // If recently modified we'll treat as new untracked file
+                        cloudfiles.remove(&full_file_path);
+                    }
+                }
+            }
+        }
+
+        println!("INFO: Cloud files {}", cloudfiles.len());
+        println!("INFO: Local files {}", local_files.len());
+
+        // Uploading locally modified files
+        for (file_path, local_modified) in local_files {
+            let result = cloudfiles.get(&file_path);
+            let is_file_modified = result.is_some()
+                && local_modified > account.last_synced
+                && local_modified > *(result.unwrap());
+
+            if is_file_modified || result.is_none() {
+                match std::fs::read_to_string(&file_path) {
+                    Ok(file_contents) => {
+                        println!("INFO: Modified file {}", file_path);
+                        let drive_relative_path = file_path.split(folder_to_sync).last().unwrap();
+
+                        match account.service {
+                            SyncService::GDrive => todo!(),
+                            SyncService::Onedrive => onedrive::upload_new_file(
+                                account,
+                                drive_relative_path,
+                                file_contents.as_bytes(),
+                            ),
+                        };
+
+                        uploaded_count += 1;
+                        cloudfiles.insert(file_path, timestamp());
+                    }
+                    Err(err) => return Err(format!("ERROR: Reading file {}: {}", file_path, err)),
+                }
+            }
+        }
+
+        println!("INFO: Downloaded files {}", downloaded_count);
+        println!("INFO: Uploaded files {}", uploaded_count);
+
+        // Updating the cloudlist
+        cloudfiles_file
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(|err| format!("Cannot write to file: {}", err))?;
+
+        // format timestamp:file_path
+        for (file_path, last_modified) in cloudfiles {
+            if let Err(err) = writeln!(cloudfiles_file, "{}:{}", last_modified, file_path) {
+                return Err(format!("ERROR: Cannot save file in file list: {}", err));
+            }
         }
     }
 
-    // TODO: Upload all local changes
-
-    // Files after sync
-    let mut files = Vec::new();
-    for delta in &deltas {
-        match delta.delta_type {
-            DriveDeltaType::CreatedOrModifiled => files.push(delta.file.clone()),
-            _ => {}
-        }
-    }
-
-    account.files = files;
-    account.last_synced = now;
+    // Save changes to account
+    account.last_synced = timestamp();
     save_account(account_name, account)?;
 
     Ok(())
+}
+// Assuming date 2023-08-06T13:23:00.093Z (ISO format)
+// @Returns unix timestamp
+fn parse_iso_date(date_time_str: &str) -> u64 {
+    let (date_str, time_str) = date_time_str.split_once('T').unwrap();
+    let date_tokens: Vec<&str> = date_str.split('-').collect();
+
+    let year: u64 = date_tokens[0].parse().unwrap();
+    let month: u64 = date_tokens[1].parse().unwrap();
+    let date: u64 = date_tokens[2].parse().unwrap();
+
+    let time_tokens: Vec<&str> = time_str.split(':').collect();
+
+    let hours: u64 = time_tokens[0].parse().unwrap();
+    let minutes: u64 = time_tokens[1].parse().unwrap();
+
+    let (seconds_str, _) = time_tokens[2].split_once('.').unwrap();
+    let seconds: u64 = seconds_str.parse().unwrap();
+
+    fn days_per_year(year: u64) -> u64 {
+        if year % 4 == 0 && year % 100 != 0 || year % 400 == 0 {
+            366
+        } else {
+            365
+        }
+    }
+
+    fn days_per_month(month: u64, year: u64) -> u64 {
+        match month {
+            1 => 31,
+            2 => {
+                if days_per_year(year) == 365 {
+                    28
+                } else {
+                    29
+                }
+            }
+            3 => 31,
+            4 => 30,
+            5 => 31,
+            6 => 30,
+            7 => 31,
+            8 => 31,
+            9 => 30,
+            10 => 31,
+            11 => 30,
+            12 => 31,
+            _ => unreachable!(),
+        }
+    }
+
+    let mut days_since_epoch = 0;
+    for y in 1970..year {
+        days_since_epoch += days_per_year(y);
+    }
+
+    let mut days_in_year_so_far = 0;
+    for m in 1..month {
+        days_in_year_so_far += days_per_month(m, year);
+    }
+    days_since_epoch += days_in_year_so_far + (date - 1);
+
+    let seconds_in_hour = 60 * 60;
+
+    (days_since_epoch * 24 * seconds_in_hour) + hours * seconds_in_hour + minutes * 60 + seconds
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parse_iso_date;
+
+    #[test]
+    fn test_date_parsing() {
+        assert_eq!(parse_iso_date("2023-08-06T13:23:00.093Z"), 1691328180);
+    }
 }

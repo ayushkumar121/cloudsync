@@ -15,6 +15,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("ERROR: Missing options");
         print_usage(program_name);
+        std::process::exit(-1);
     }
 
     let command = &args[1];
@@ -25,11 +26,12 @@ fn main() {
         "save" => cloudsync::save(&args),
         _ => {
             print_usage(program_name);
-            Ok(())
+            Err("Invalid arguments".to_string())
         }
     };
 
     if let Err(err) = res {
         eprintln!("ERROR: {err}");
+        std::process::exit(-1);
     }
 }
