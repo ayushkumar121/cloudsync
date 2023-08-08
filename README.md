@@ -37,6 +37,6 @@ Cloud syncing utility
 ## Supported Cloud Providers
 
 - One Drive
-- Google Drive
+- Google Drive (Not implemented yet)
 
 ## References
