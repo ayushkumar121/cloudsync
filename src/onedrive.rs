@@ -40,7 +40,7 @@ struct ParentReference {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Deleted {
-    state: Option<String>,
+    state: String,
 }
 
 #[allow(non_snake_case)]
@@ -76,7 +76,7 @@ fn get_delta(account: &mut Account, api_url: &str, items: &mut Vec<OneDriveItem>
     let mut handle = Easy::new();
     let mut response_body = Vec::new();
 
-    handle.url(api_url).unwrap();
+    handle.url(&api_url).unwrap();
     handle.http_headers(headers).unwrap();
     {
         let mut transfer = handle.transfer();
@@ -209,28 +209,31 @@ pub fn get_drive_delta(account: &mut Account) -> Result<Vec<DriveDelta>, String>
 
     let mut cloud_files = Vec::new();
     for file in files {
-        // Skip anything that isn't a file
-        if file.file.is_none() {
+        // Skipping folders
+        if file.folder.is_some() {
             continue;
         }
 
-        if let Some(parent) = file.parentReference.path {
-            let mut parent = parent.clone();
+        let file_path = if let Some(mut parent) = file.parentReference.path {
             let folder = parent.split_off(12);
-            let file_path = format!("{}/{}", folder, file.name);
-            let last_modified = parse_iso_date(&file.lastModifiedDateTime.unwrap());
+            format!("{}/{}", folder, file.name)
+        } else {
+            format!("/{}", file.name)
+        };
 
-            cloud_files.push(DriveDelta {
-                file: TrackedFile {
-                    file_path,
-                    last_modified,
-                },
-                delta_type: match file.deleted {
-                    Some(_) => DriveDeltaType::Deleted,
-                    None => DriveDeltaType::CreatedOrModifiled,
-                },
-            });
-        }
+        let last_modified = parse_iso_date(&file.lastModifiedDateTime.unwrap());
+
+        cloud_files.push(DriveDelta {
+            file: TrackedFile {
+                file_path,
+                last_modified,
+            },
+            delta_type: if file.deleted.is_some() {
+                DriveDeltaType::Deleted
+            } else {
+                DriveDeltaType::CreatedOrModifiled
+            },
+        });
     }
 
     Ok(cloud_files)
@@ -277,6 +280,7 @@ pub fn get_token(code: &str, grant_type: &str) -> Result<Token, String> {
 
     handle.url(api_url).unwrap();
     handle.httppost(form).unwrap();
+    handle.fail_on_error(true).unwrap();
     {
         let mut transfer = handle.transfer();
         transfer
@@ -285,7 +289,10 @@ pub fn get_token(code: &str, grant_type: &str) -> Result<Token, String> {
                 Ok(data.len())
             })
             .unwrap();
-        transfer.perform().unwrap();
+
+        transfer
+            .perform()
+            .map_err(|err| format!("Cannot perform request: {}", err))?;
     }
 
     let microsoft_token: MicrosoftGraphToken =
