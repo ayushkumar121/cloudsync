@@ -320,6 +320,19 @@ fn sync_files(
         read_dir_rec(&folder_to_sync, &mut local_files)
             .map_err(|err| format!("Cannot walk folder to sync: {}", err))?;
 
+        // Deleting local files incase of
+        // fresh sync
+        if sync_flags.fresh {
+            println!("INFO: Cleaning up local files {}", local_files.len());
+
+            for (file_path, _) in &local_files {
+                std::fs::remove_file(file_path)
+                    .map_err(|err| format!("Cannot remove file: {}", err))?;
+            }
+
+            local_files = HashMap::new();
+        }
+
         let mut downloaded_count = 0;
         let mut uploaded_count = 0;
         let mut deleted_local_count = 0;
