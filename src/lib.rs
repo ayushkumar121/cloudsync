@@ -62,10 +62,15 @@ pub fn urlencode(data: &str) -> String {
     data.replace(" ", "%20")
 }
 
+#[derive(Default)]
+struct SyncFlags {
+    fresh: bool,
+}
+
 // Assuming args
-// clousync sync <folder> <account_name>
+// clousync sync <folder> <account_name> [--fresh/-f]
 pub fn sync(args: &Vec<String>) -> Result<(), String> {
-    if args.len() != 4 {
+    if args.len() < 4 {
         return Err("Incorrect no of arguments".to_string());
     }
 
@@ -75,7 +80,19 @@ pub fn sync(args: &Vec<String>) -> Result<(), String> {
     let folder_path = std::fs::canonicalize(folder)
         .map_err(|err| format!("Cannot sync to {} because: {}", folder, err))?;
 
-    // TODO: check if folder is valid folder
+    let mut sync_flags = SyncFlags::default();
+
+    // Parsing flags
+    // Flags come after the positional arguments
+    for i in 4..args.len() {
+        let flag = &args[i];
+        match flag.as_str() {
+            "--fresh" | "-f" => sync_flags.fresh = true,
+            _ => {
+                return Err("Invalid flags".to_string());
+            }
+        };
+    }
 
     let folder_path_str = folder_path.to_string_lossy().to_string();
 
@@ -87,7 +104,7 @@ pub fn sync(args: &Vec<String>) -> Result<(), String> {
         .map_err(|err| format!("Cannot read config: {}", err))?;
 
     if let Some(account) = config.accounts.get_mut(account_name) {
-        sync_files(account, account_name, &folder_path_str)?;
+        sync_files(account, account_name, &folder_path_str, &sync_flags)?;
     } else {
         return Err("Unknown account name please login first".to_string());
     }
@@ -98,7 +115,7 @@ pub fn sync(args: &Vec<String>) -> Result<(), String> {
 // Assuming args
 // clousync login <gdrive|onedrive>
 pub fn login(args: &Vec<String>) -> Result<(), String> {
-    if args.len() != 3 {
+    if args.len() < 3 {
         return Err("Incorrect no of arguments".to_string());
     }
 
@@ -122,7 +139,7 @@ pub fn login(args: &Vec<String>) -> Result<(), String> {
 // Assuming args
 // clousync save <gdrive|onedrive> <account_name> <auth_code>
 pub fn save(args: &Vec<String>) -> Result<(), String> {
-    if args.len() != 5 {
+    if args.len() < 5 {
         return Err("Incorrect no of arguments".to_string());
     }
 
@@ -242,6 +259,7 @@ fn sync_files(
     account: &mut Account,
     account_name: &str,
     folder_to_sync: &String,
+    sync_flags: &SyncFlags,
 ) -> Result<(), String> {
     println!("Syncing {} to {}", folder_to_sync, account_name);
 
@@ -249,6 +267,11 @@ fn sync_files(
     if now > account.token.valid_till {
         println!("INFO: Token refreshed");
         refresh_token(account)?;
+    }
+
+    if sync_flags.fresh {
+        account.last_synced = 0;
+        account.attributes = HashMap::new();
     }
 
     println!("INFO: Reading existing cloudlist");
@@ -271,22 +294,25 @@ fn sync_files(
 
         let mut cloudfiles = HashMap::new();
 
-        let cloudfiles_file_lines = cloudfiles_file_contents.lines();
-        for line in cloudfiles_file_lines {
-            let (last_modified_str, file_path) = match line.split_once(':') {
-                Some(pair) => pair,
-                None => {
-                    return Err(
-                        "Incorrect .cloudfile please resync this folder from start".to_string()
-                    )
-                }
-            };
+        // Only read cloudfiles if we're not freshly syncing
+        if !sync_flags.fresh {
+            let cloudfiles_file_lines = cloudfiles_file_contents.lines();
+            for line in cloudfiles_file_lines {
+                let (last_modified_str, file_path) = match line.split_once(':') {
+                    Some(pair) => pair,
+                    None => {
+                        return Err(
+                            "Incorrect .cloudfile please resync this folder from start".to_string()
+                        )
+                    }
+                };
 
-            let last_modified: u64 = last_modified_str
-                .parse()
-                .map_err(|err| format!("Unknown config format {}", err))?;
+                let last_modified: u64 = last_modified_str
+                    .parse()
+                    .map_err(|err| format!("Unknown config format {}", err))?;
 
-            cloudfiles.insert(file_path.to_string(), last_modified);
+                cloudfiles.insert(file_path.to_string(), last_modified);
+            }
         }
 
         // Getting local changes
@@ -320,11 +346,21 @@ fn sync_files(
             let full_file_path = format!("{}{}", folder_to_sync, delta.file.file_path);
             let local_modified = local_files.get(&full_file_path).map_or(0, |val| *val);
 
+            // Making sure cloud files get priotity on
+            // fresh fetch
+            let cloud_modified = if sync_flags.fresh {
+                timestamp()
+            } else {
+                delta.file.last_modified
+            };
+
             match delta.delta_type {
                 DriveDeltaType::Deleted => {
-                    if delta.file.last_modified > local_modified {
-                        std::fs::remove_file(&full_file_path).map_err(|err| err.to_string())?;
-                        println!("INFO: Deleted {}", delta.file.file_path);
+                    if cloud_modified > local_modified {
+                        println!("INFO: Deleting  {:?}", delta);
+
+                        std::fs::remove_file(&full_file_path)
+                            .map_err(|err| format!("Cannot remove file: {}", err))?;
                         local_files.remove(&full_file_path);
                         deleted_local_count += 1;
                     }
@@ -332,7 +368,9 @@ fn sync_files(
                     cloudfiles.remove(&full_file_path);
                 }
                 DriveDeltaType::CreatedOrModifiled => {
-                    if delta.file.last_modified > local_modified {
+                    if cloud_modified > local_modified {
+                        println!("INFO: Downloading {}", delta.file.file_path);
+
                         let full_folder_path = format!("{}/{}", folder_to_sync, folder);
                         std::fs::create_dir_all(&full_folder_path)
                             .map_err(|err| err.to_string())?;
@@ -346,8 +384,6 @@ fn sync_files(
 
                         std::fs::write(&full_file_path, file_contents)
                             .map_err(|err| err.to_string())?;
-
-                        println!("INFO: Downloaded {}", delta.file.file_path);
 
                         let ts = timestamp();
                         cloudfiles.insert(full_file_path.clone(), ts);
@@ -372,7 +408,8 @@ fn sync_files(
             if is_file_modified || result.is_none() {
                 match std::fs::read_to_string(&file_path) {
                     Ok(file_contents) => {
-                        println!("INFO: Modified file {}", file_path);
+                        println!("INFO: Uploading {}", file_path);
+
                         let drive_relative_path = file_path.split(folder_to_sync).last().unwrap();
 
                         match account.service {

@@ -2,7 +2,7 @@
 fn print_usage(program_name: &String) {
     println!("\n{} [OPTIONS]", program_name);
     println!("Cloud syncing utility");
-    println!("\t sync  <folder> <account_name>                      : syncs the folder to cloud provider");
+    println!("\t sync  <folder> <account_name> [--fresh|-f]         : syncs the folder to cloud provider, --fresh flag does a fetch from begining");
     println!("\t login <gdrive|onedrive>                            : prints the login url");
     println!("\t save  <gdrive|onedrive> <account_name> <auth_code> : Requests access token and saves it to config file");
     println!("\t help                                               : prints this menu ");
