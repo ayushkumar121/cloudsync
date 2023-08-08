@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
     io::Read,
-    io::{Seek, Write},
+    io::Seek,
+    io::Write,
     os::unix::prelude::FileExt,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -250,11 +251,6 @@ fn sync_files(
         refresh_token(account)?;
     }
 
-    let deltas = match account.service {
-        SyncService::GDrive => todo!(),
-        SyncService::Onedrive => onedrive::get_drive_delta(account)?,
-    };
-
     println!("INFO: Reading existing cloudlist");
 
     // Creating a scope so file is closed
@@ -303,9 +299,16 @@ fn sync_files(
         let mut deleted_local_count = 0;
         let mut deleted_cloud_count = 0;
 
-        println!("INFO: Cloud Delta {}", deltas.len());
-
         // Getting cloud changes
+        let deltas = match account.service {
+            SyncService::GDrive => todo!(),
+            SyncService::Onedrive => onedrive::get_drive_delta(account)?,
+        };
+
+        println!("INFO: Cloud Delta {}", deltas.len());
+        println!("INFO: Cloud files {}", cloudfiles.len());
+        println!("INFO: Local files {}", local_files.len());
+
         for delta in &deltas {
             // Skip the cloud sync cloud we have
             // already have this file from the last sync
@@ -319,15 +322,14 @@ fn sync_files(
 
             match delta.delta_type {
                 DriveDeltaType::Deleted => {
-                    // TODO:
-                    // if delta.file.last_modified > local_modified {
-                    //     std::fs::remove_file(&full_file_path).map_err(|err| err.to_string())?;
-                    //     println!("INFO: Deleted {}", delta.file.file_path);
-                    // }
+                    if delta.file.last_modified > local_modified {
+                        std::fs::remove_file(&full_file_path).map_err(|err| err.to_string())?;
+                        println!("INFO: Deleted {}", delta.file.file_path);
+                        local_files.remove(&full_file_path);
+                        deleted_local_count += 1;
+                    }
 
-                    // cloudfiles.remove(&full_file_path);
-
-                    deleted_local_count += 1;
+                    cloudfiles.remove(&full_file_path);
                 }
                 DriveDeltaType::CreatedOrModifiled => {
                     if delta.file.last_modified > local_modified {
@@ -340,7 +342,7 @@ fn sync_files(
                             SyncService::Onedrive => {
                                 onedrive::download_file(account, &delta.file.file_path)
                             }
-                        };
+                        }?;
 
                         std::fs::write(&full_file_path, file_contents)
                             .map_err(|err| err.to_string())?;
@@ -358,9 +360,6 @@ fn sync_files(
                 }
             }
         }
-
-        println!("INFO: Cloud files {}", cloudfiles.len());
-        println!("INFO: Local files {}", local_files.len());
 
         // Uploading locally modified files
         for (file_path, local_modified) in &local_files {
@@ -383,7 +382,7 @@ fn sync_files(
                                 drive_relative_path,
                                 file_contents.as_bytes(),
                             ),
-                        };
+                        }?;
 
                         uploaded_count += 1;
                         cloudfiles.insert(file_path.clone(), timestamp());
@@ -393,13 +392,9 @@ fn sync_files(
             }
         }
 
-        // Updating the cloudlist
-        cloudfiles_file
-            .seek(std::io::SeekFrom::Start(0))
-            .map_err(|err| format!("Cannot write to file: {}", err))?;
-
-        // format timestamp:file_path
-        for (file_path, last_modified) in &cloudfiles {
+        // IDK if we need to clone this
+        let cloudfiles_copy = cloudfiles.clone();
+        for (file_path, _) in &cloudfiles_copy {
             // Removing cloud files
             if local_files.get(file_path).is_none() {
                 let drive_relative_path = file_path.split(folder_to_sync).last().unwrap();
@@ -407,13 +402,10 @@ fn sync_files(
                 match account.service {
                     SyncService::GDrive => todo!(),
                     SyncService::Onedrive => onedrive::delete_file(&account, drive_relative_path),
-                };
+                }?;
 
                 deleted_cloud_count += 1;
-            } else {
-                if let Err(err) = writeln!(cloudfiles_file, "{}:{}", last_modified, file_path) {
-                    return Err(format!("ERROR: Cannot save file in file list: {}", err));
-                }
+                cloudfiles.remove(file_path);
             }
         }
 
@@ -421,6 +413,21 @@ fn sync_files(
         println!("INFO: Uploaded files {}", uploaded_count);
         println!("INFO: Deleted local {}", deleted_local_count);
         println!("INFO: Deleted cloud {}", deleted_cloud_count);
+
+        // Truncating the file
+        cloudfiles_file
+            .set_len(0)
+            .map_err(|err| format!("Cannot write to file: {}", err))?;
+
+        cloudfiles_file.seek(std::io::SeekFrom::Start(0)).unwrap();
+
+        // format timestamp:file_path
+        // Writing cloudfile to file
+        for (file_path, last_modified) in &cloudfiles {
+            if let Err(err) = writeln!(cloudfiles_file, "{}:{}", last_modified, file_path) {
+                return Err(format!("ERROR: Cannot save file in file list: {}", err));
+            }
+        }
     }
 
     // Save changes to account

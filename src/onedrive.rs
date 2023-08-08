@@ -39,7 +39,9 @@ struct ParentReference {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct Deleted {}
+struct Deleted {
+    state: Option<String>,
+}
 
 #[allow(non_snake_case)]
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -102,7 +104,7 @@ fn get_delta(account: &mut Account, api_url: &str, items: &mut Vec<OneDriveItem>
     }
 }
 
-pub fn download_file(account: &Account, item_path: &str) -> String {
+pub fn download_file(account: &Account, item_path: &str) -> Result<String, String> {
     let mut headers = List::new();
     headers
         .append(format!("Authorization:Bearer {}", account.token.access_token).as_str())
@@ -119,6 +121,7 @@ pub fn download_file(account: &Account, item_path: &str) -> String {
     handle.url(&api_url).unwrap();
     handle.follow_location(true).unwrap();
     handle.http_headers(headers).unwrap();
+    handle.fail_on_error(true).unwrap();
     {
         let mut transfer = handle.transfer();
         transfer
@@ -127,13 +130,19 @@ pub fn download_file(account: &Account, item_path: &str) -> String {
                 Ok(data.len())
             })
             .unwrap();
-        transfer.perform().unwrap();
+        transfer
+            .perform()
+            .map_err(|err| format!("Cannot perform request: {}", err))?;
     }
 
-    String::from_utf8_lossy(response_body.as_slice()).to_string()
+    Ok(String::from_utf8_lossy(response_body.as_slice()).to_string())
 }
 
-pub fn upload_new_file(account: &Account, item_path: &str, mut contents: &[u8]) {
+pub fn upload_new_file(
+    account: &Account,
+    item_path: &str,
+    mut contents: &[u8],
+) -> Result<(), String> {
     let mut headers = List::new();
     headers
         .append(format!("Authorization:Bearer {}", account.token.access_token).as_str())
@@ -150,16 +159,19 @@ pub fn upload_new_file(account: &Account, item_path: &str, mut contents: &[u8]) 
     handle.url(&api_url).unwrap();
     handle.http_headers(headers).unwrap();
     handle.put(true).unwrap();
+    handle.fail_on_error(true).unwrap();
     {
         let mut transfer = handle.transfer();
         transfer
             .read_function(|into| Ok(contents.read(into).unwrap()))
             .unwrap();
-        transfer.perform().unwrap();
+        transfer
+            .perform()
+            .map_err(|err| format!("Cannot perform request: {}", err))
     }
 }
 
-pub fn delete_file(account: &Account, item_path: &str) {
+pub fn delete_file(account: &Account, item_path: &str) -> Result<(), String> {
     let mut headers = List::new();
     headers
         .append(format!("Authorization:Bearer {}", account.token.access_token).as_str())
@@ -168,7 +180,7 @@ pub fn delete_file(account: &Account, item_path: &str) {
 
     let item_path_escaped = urlencode(item_path);
     let api_url = format!(
-        "https://graph.microsoft.com/v1.0/me/drive/root:{}:/content",
+        "https://graph.microsoft.com/v1.0/me/drive/root:{}",
         item_path_escaped
     );
     let mut handle = Easy::new();
@@ -176,7 +188,11 @@ pub fn delete_file(account: &Account, item_path: &str) {
     handle.url(&api_url).unwrap();
     handle.http_headers(headers).unwrap();
     handle.custom_request("DELETE").unwrap();
-    handle.perform().unwrap();
+    handle.fail_on_error(true).unwrap();
+
+    handle
+        .perform()
+        .map_err(|err| format!("Cannot perform request: {}", err))
 }
 
 pub fn get_drive_delta(account: &mut Account) -> Result<Vec<DriveDelta>, String> {
@@ -198,7 +214,8 @@ pub fn get_drive_delta(account: &mut Account) -> Result<Vec<DriveDelta>, String>
             continue;
         }
 
-        if let Some(mut parent) = file.parentReference.path {
+        if let Some(parent) = file.parentReference.path {
+            let mut parent = parent.clone();
             let folder = parent.split_off(12);
             let file_path = format!("{}/{}", folder, file.name);
             let last_modified = parse_iso_date(&file.lastModifiedDateTime.unwrap());
