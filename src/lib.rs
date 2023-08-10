@@ -501,7 +501,7 @@ fn parse_iso_date(date_time_str: &str) -> u64 {
     let hours: u64 = time_tokens[0].parse().unwrap();
     let minutes: u64 = time_tokens[1].parse().unwrap();
 
-    let (seconds_str, _) = time_tokens[2].split_once('.').unwrap();
+    let seconds_str = &time_tokens[2][0..2];
     let seconds: u64 = seconds_str.parse().unwrap();
 
     fn days_per_year(year: u64) -> u64 {
@@ -558,6 +558,6 @@ mod tests {
 
     #[test]
     fn test_date_parsing() {
-        assert_eq!(parse_iso_date("2023-08-06T13:23:00.093Z"), 1691328180);
+        assert_eq!(parse_iso_date("2023-08-06T13:23:00Z"), 1691328180);
     }
 }
