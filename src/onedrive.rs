@@ -47,8 +47,7 @@ struct Deleted {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct OneDriveItem {
     id: String,
-    name: String,
-    webUrl: String,
+    name: Option<String>,
     parentReference: ParentReference,
     size: Option<u32>,
     createdDateTime: Option<String>,
@@ -214,15 +213,16 @@ pub fn get_drive_delta(account: &mut Account) -> Result<Vec<DriveDelta>, String>
             continue;
         }
 
-        if file.name.is_empty() {
+        if file.name.is_none() {
             continue;
         }
 
+        let file_name = file.name.unwrap();
         let file_path = if let Some(mut parent) = file.parentReference.path {
             let folder = parent.split_off(12);
-            format!("{}/{}", folder, file.name)
+            format!("{}/{}", folder, file_name)
         } else {
-            format!("/{}", file.name)
+            format!("/{}", file_name)
         };
 
         let last_modified = parse_iso_date(&file.lastModifiedDateTime.unwrap());

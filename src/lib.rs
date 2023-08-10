@@ -231,10 +231,10 @@ fn read_dir_rec(folder: &str, files: &mut HashMap<String, u64>) -> std::io::Resu
     for entry in dir_entries {
         if let Ok(entry) = entry {
             let metadata = entry.metadata()?;
-            let file_path = entry.path();
+            let file_path = entry.path().to_str().unwrap().to_string();
 
             if metadata.is_dir() {
-                read_dir_rec(file_path.to_str().unwrap(), files)?;
+                read_dir_rec(&file_path, files)?;
             } else {
                 let last_modified = metadata
                     .modified()?
@@ -242,7 +242,7 @@ fn read_dir_rec(folder: &str, files: &mut HashMap<String, u64>) -> std::io::Resu
                     .unwrap()
                     .as_secs();
 
-                files.insert(file_path.to_str().unwrap().to_owned(), last_modified);
+                files.insert(file_path, last_modified);
             }
         }
     }
@@ -356,7 +356,8 @@ fn sync_files(
             }
 
             let (folder, _) = delta.file.file_path.rsplit_once("/").unwrap();
-            let full_file_path = format!("{}{}", folder_to_sync, delta.file.file_path);
+            let file_path = delta.file.file_path.clone();
+            let full_file_path = format!("{}{}", folder_to_sync, file_path);
             let local_modified = local_files.get(&full_file_path).map_or(0, |val| *val);
 
             // Making sure cloud files get priotity on
@@ -370,41 +371,51 @@ fn sync_files(
             match delta.delta_type {
                 DriveDeltaType::Deleted => {
                     if cloud_modified > local_modified {
-                        println!("INFO: Deleting  {:?}", delta);
+                        println!("INFO: Deleting local file {}", full_file_path);
 
-                        std::fs::remove_file(&full_file_path)
-                            .map_err(|err| format!("Cannot remove file: {}", err))?;
-                        local_files.remove(&full_file_path);
-                        deleted_local_count += 1;
+                        match std::fs::remove_file(&full_file_path) {
+                            Ok(_) => {
+                                local_files.remove(&full_file_path);
+                                deleted_local_count += 1;
+                            }
+                            Err(err) => {
+                                println!("ERROR: Cannot remove file: {}", err)
+                            }
+                        };
                     }
 
-                    cloudfiles.remove(&full_file_path);
+                    cloudfiles.remove(&file_path);
                 }
                 DriveDeltaType::CreatedOrModifiled => {
                     if cloud_modified > local_modified {
-                        println!("INFO: Downloading {}", delta.file.file_path);
+                        println!("INFO: Downloading {}", file_path);
 
                         let full_folder_path = format!("{}/{}", folder_to_sync, folder);
                         std::fs::create_dir_all(&full_folder_path)
                             .map_err(|err| err.to_string())?;
 
-                        let file_contents = match account.service {
+                        let response = match account.service {
                             SyncService::GDrive => todo!(),
-                            SyncService::Onedrive => {
-                                onedrive::download_file(account, &delta.file.file_path)
+                            SyncService::Onedrive => onedrive::download_file(account, &file_path),
+                        };
+
+                        match response {
+                            Ok(contents) => {
+                                std::fs::write(&full_file_path, contents)
+                                    .map_err(|err| err.to_string())?;
+
+                                let ts = timestamp();
+                                cloudfiles.insert(file_path.clone(), ts);
+                                local_files.insert(full_file_path, ts);
+                                downloaded_count += 1;
                             }
-                        }?;
-
-                        std::fs::write(&full_file_path, file_contents)
-                            .map_err(|err| err.to_string())?;
-
-                        let ts = timestamp();
-                        cloudfiles.insert(full_file_path.clone(), ts);
-                        local_files.insert(full_file_path, ts);
-                        downloaded_count += 1;
+                            Err(err) => {
+                                println!("ERROR: Downloading file {}", err);
+                            }
+                        };
                     } else {
                         // If recently modified we'll treat as new untracked file
-                        cloudfiles.remove(&full_file_path);
+                        cloudfiles.remove(&file_path);
                     }
                 }
             }
@@ -412,7 +423,8 @@ fn sync_files(
 
         // Uploading locally modified files
         for (file_path, local_modified) in &local_files {
-            let result = cloudfiles.get(file_path);
+            let drive_relative_path = file_path.split(folder_to_sync).last().unwrap();
+            let result = cloudfiles.get(drive_relative_path);
             let local_modified = *local_modified;
             let is_file_modified = result.is_some()
                 && local_modified > account.last_synced
@@ -423,39 +435,55 @@ fn sync_files(
                     Ok(file_contents) => {
                         println!("INFO: Uploading {}", file_path);
 
-                        let drive_relative_path = file_path.split(folder_to_sync).last().unwrap();
-
-                        match account.service {
+                        let response = match account.service {
                             SyncService::GDrive => todo!(),
                             SyncService::Onedrive => onedrive::upload_new_file(
                                 account,
-                                drive_relative_path,
+                                &drive_relative_path,
                                 &file_contents,
                             ),
-                        }?;
+                        };
 
-                        uploaded_count += 1;
-                        cloudfiles.insert(file_path.clone(), timestamp());
+                        match response {
+                            Ok(_) => {
+                                cloudfiles.insert(drive_relative_path.to_string(), timestamp());
+                                uploaded_count += 1;
+                            }
+                            Err(err) => {
+                                println!("ERROR: Uploading file: {}", err);
+                            }
+                        };
                     }
-                    Err(err) => return Err(format!("ERROR: Reading file {}: {}", file_path, err)),
+                    Err(err) => {
+                        println!("ERROR: Reading file {}: {}", file_path, err);
+                    }
                 }
             }
         }
 
+        // Removing cloud files
         // IDK if we need to clone this
         let cloudfiles_copy = cloudfiles.clone();
         for (file_path, _) in &cloudfiles_copy {
-            // Removing cloud files
-            if local_files.get(file_path).is_none() {
-                let drive_relative_path = file_path.split(folder_to_sync).last().unwrap();
+            let full_file_path = format!("{}{}", folder_to_sync, file_path);
+            if local_files.get(&full_file_path).is_none() {
+                println!("INFO: Cloud deleting file {}", file_path);
 
-                match account.service {
+                let drive_relative_path = file_path.split(folder_to_sync).last().unwrap();
+                let response = match account.service {
                     SyncService::GDrive => todo!(),
                     SyncService::Onedrive => onedrive::delete_file(&account, drive_relative_path),
-                }?;
+                };
 
-                deleted_cloud_count += 1;
-                cloudfiles.remove(file_path);
+                match response {
+                    Ok(_) => {
+                        cloudfiles.remove(drive_relative_path);
+                        deleted_cloud_count += 1;
+                    }
+                    Err(err) => {
+                        println!("ERROR: Cloud deleting file: {}", err);
+                    }
+                };
             }
         }
 
