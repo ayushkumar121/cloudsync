@@ -419,7 +419,7 @@ fn sync_files(
                 && local_modified > *(result.unwrap());
 
             if is_file_modified || result.is_none() {
-                match std::fs::read_to_string(&file_path) {
+                match std::fs::read(&file_path) {
                     Ok(file_contents) => {
                         println!("INFO: Uploading {}", file_path);
 
@@ -430,7 +430,7 @@ fn sync_files(
                             SyncService::Onedrive => onedrive::upload_new_file(
                                 account,
                                 drive_relative_path,
-                                file_contents.as_bytes(),
+                                &file_contents,
                             ),
                         }?;
 
