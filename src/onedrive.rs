@@ -77,7 +77,7 @@ fn get_delta(account: &mut Account, api_url: &str, items: &mut Vec<OneDriveItem>
     let mut handle = Easy::new();
     let mut response_body = Vec::new();
 
-    handle.url(&api_url).unwrap();
+    handle.url(api_url).unwrap();
     handle.http_headers(headers).unwrap();
     {
         let mut transfer = handle.transfer();

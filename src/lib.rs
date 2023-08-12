@@ -65,7 +65,7 @@ struct CloudState {
 }
 
 pub fn urlencode(data: &str) -> String {
-    data.replace(" ", "%20")
+    data.replace(' ', "%20")
 }
 
 #[derive(Default)]
@@ -90,8 +90,7 @@ pub fn sync(args: &Vec<String>) -> Result<(), String> {
 
     // Parsing flags
     // Flags come after the positional arguments
-    for i in 4..args.len() {
-        let flag = &args[i];
+    for flag in args.iter().skip(4) {
         match flag.as_str() {
             "--fresh" | "-f" => sync_flags.fresh = true,
             _ => {
@@ -234,22 +233,20 @@ fn refresh_token(account: &mut Account) -> Result<(), String> {
 fn read_dir_rec(folder: &str, files: &mut HashMap<String, u64>) -> std::io::Result<()> {
     let dir_entries = std::fs::read_dir(folder)?;
 
-    for entry in dir_entries {
-        if let Ok(entry) = entry {
-            let metadata = entry.metadata()?;
-            let file_path = entry.path().to_str().unwrap().to_string();
+    for entry in dir_entries.flatten() {
+        let metadata = entry.metadata()?;
+        let file_path = entry.path().to_str().unwrap().to_string();
 
-            if metadata.is_dir() {
-                read_dir_rec(&file_path, files)?;
-            } else {
-                let last_modified = metadata
-                    .modified()?
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
+        if metadata.is_dir() {
+            read_dir_rec(&file_path, files)?;
+        } else {
+            let last_modified = metadata
+                .modified()?
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
 
-                files.insert(file_path, last_modified);
-            }
+            files.insert(file_path, last_modified);
         }
     }
 
@@ -322,7 +319,7 @@ fn sync_files(
 
         // Getting local changes
         let mut local_files = HashMap::new();
-        read_dir_rec(&folder_to_sync, &mut local_files)
+        read_dir_rec(folder_to_sync, &mut local_files)
             .map_err(|err| format!("Cannot walk folder to sync: {}", err))?;
 
         // Deleting local files incase of
@@ -355,7 +352,7 @@ fn sync_files(
                 continue;
             }
 
-            let (folder, _) = delta.file_path.rsplit_once("/").unwrap();
+            let (folder, _) = delta.file_path.rsplit_once('/').unwrap();
             let file_path = delta.file_path.clone();
             let full_file_path = format!("{}{}", folder_to_sync, file_path);
             let local_modified = local_files.get(&full_file_path).map_or(0, |val| *val);
@@ -440,7 +437,7 @@ fn sync_files(
                 && local_modified > result.unwrap().1.last_modified;
 
             if is_file_modified || result.is_none() {
-                match std::fs::read(&file_path) {
+                match std::fs::read(file_path) {
                     Ok(file_contents) => {
                         println!("INFO: Uploading {}", file_path);
 
@@ -448,7 +445,7 @@ fn sync_files(
                             SyncService::GDrive => todo!(),
                             SyncService::Onedrive => onedrive::upload_new_file(
                                 account,
-                                &drive_relative_path,
+                                drive_relative_path,
                                 &file_contents,
                             ),
                         };
@@ -485,7 +482,7 @@ fn sync_files(
 
                 let response = match account.service {
                     SyncService::GDrive => todo!(),
-                    SyncService::Onedrive => onedrive::delete_file(&account, &entry.cloud_id),
+                    SyncService::Onedrive => onedrive::delete_file(account, &entry.cloud_id),
                 };
 
                 match response {
