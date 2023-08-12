@@ -186,17 +186,16 @@ pub fn upload_new_file(
     Ok(drive_item.id)
 }
 
-pub fn delete_file(account: &Account, item_path: &str) -> Result<(), String> {
+pub fn delete_file(account: &Account, cloud_id: &str) -> Result<(), String> {
     let mut headers = List::new();
     headers
         .append(format!("Authorization:Bearer {}", account.token.access_token).as_str())
         .unwrap();
     headers.append("Content-Type: text/plain").unwrap();
 
-    let item_path_escaped = urlencode(item_path);
     let api_url = format!(
-        "https://graph.microsoft.com/v1.0/me/drive/root:{}",
-        item_path_escaped
+        "https://graph.microsoft.com/v1.0/me/drive/items/{}",
+        cloud_id
     );
     let mut handle = Easy::new();
 
