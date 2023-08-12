@@ -6,7 +6,7 @@ use std::{
 use curl::easy::{Easy, Form, List};
 use serde::{Deserialize, Serialize};
 
-use crate::{parse_iso_date, urlencode, Account, DriveDelta, DriveDeltaType, Token, TrackedFile};
+use crate::{parse_iso_date, urlencode, Account, DriveDelta, DriveDeltaType, Token};
 
 const CLIENT_ID: &str = "3dceca68-abd4-46a1-9e72-9dda8a80d9c1";
 const REDIRECT_URL: &str = "https://login.microsoftonline.com/common/oauth2/nativeclient";
@@ -48,9 +48,11 @@ struct Deleted {
 struct OneDriveItem {
     id: String,
     name: Option<String>,
+
+    // Deleted files do not have
+    // path in parent reference
     parentReference: ParentReference,
-    size: Option<u32>,
-    createdDateTime: Option<String>,
+
     lastModifiedDateTime: Option<String>,
     file: Option<FileProperties>,
     folder: Option<FolderProperties>,
@@ -103,7 +105,7 @@ fn get_delta(account: &mut Account, api_url: &str, items: &mut Vec<OneDriveItem>
     }
 }
 
-pub fn download_file(account: &Account, item_path: &str) -> Result<String, String> {
+pub fn download_file(account: &Account, item_path: &str) -> Result<Vec<u8>, String> {
     let mut headers = List::new();
     headers
         .append(format!("Authorization:Bearer {}", account.token.access_token).as_str())
@@ -134,14 +136,14 @@ pub fn download_file(account: &Account, item_path: &str) -> Result<String, Strin
             .map_err(|err| format!("Cannot perform request: {}", err))?;
     }
 
-    Ok(String::from_utf8_lossy(response_body.as_slice()).to_string())
+    Ok(response_body)
 }
 
 pub fn upload_new_file(
     account: &Account,
     item_path: &str,
     mut contents: &[u8],
-) -> Result<(), String> {
+) -> Result<String, String> {
     let mut headers = List::new();
     headers
         .append(format!("Authorization:Bearer {}", account.token.access_token).as_str())
@@ -154,6 +156,7 @@ pub fn upload_new_file(
         item_path_escaped
     );
     let mut handle = Easy::new();
+    let mut response_body = Vec::new();
 
     handle.url(&api_url).unwrap();
     handle.http_headers(headers).unwrap();
@@ -164,10 +167,23 @@ pub fn upload_new_file(
         transfer
             .read_function(|into| Ok(contents.read(into).unwrap()))
             .unwrap();
+
+        transfer
+            .write_function(|data| {
+                response_body.extend_from_slice(data);
+                Ok(data.len())
+            })
+            .unwrap();
+
         transfer
             .perform()
-            .map_err(|err| format!("Cannot perform request: {}", err))
+            .map_err(|err| format!("Cannot perform request: {}", err))?;
     }
+
+    let drive_item: OneDriveItem = serde_json::from_slice(&response_body)
+        .map_err(|err| format!("Cannot parse response: {}", err))?;
+
+    Ok(drive_item.id)
 }
 
 pub fn delete_file(account: &Account, item_path: &str) -> Result<(), String> {
@@ -228,10 +244,9 @@ pub fn get_drive_delta(account: &mut Account) -> Result<Vec<DriveDelta>, String>
         let last_modified = parse_iso_date(&file.lastModifiedDateTime.unwrap());
 
         cloud_files.push(DriveDelta {
-            file: TrackedFile {
-                file_path,
-                last_modified,
-            },
+            cloud_id: file.id,
+            file_path,
+            last_modified,
             delta_type: if file.deleted.is_some() {
                 DriveDeltaType::Deleted
             } else {

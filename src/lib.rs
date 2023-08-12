@@ -1,13 +1,12 @@
 use std::{
     collections::HashMap,
-    io::Read,
-    io::Seek,
-    io::Write,
+    io::{Read, Seek},
     os::unix::prelude::FileExt,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
+
 pub mod onedrive;
 
 const BOLD_START: &str = "\x1b[1m";
@@ -34,21 +33,16 @@ pub enum DriveDeltaType {
 
 #[derive(Debug)]
 pub struct DriveDelta {
-    file: TrackedFile,
-    delta_type: DriveDeltaType,
-}
-
-#[derive(Clone, Debug)]
-pub struct TrackedFile {
+    pub cloud_id: String,
     pub file_path: String,
     pub last_modified: u64,
+    pub delta_type: DriveDeltaType,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Account {
     pub service: SyncService,
     pub token: Token,
-
     pub last_synced: u64,
     pub attributes: HashMap<String, String>,
 }
@@ -56,6 +50,18 @@ pub struct Account {
 #[derive(Serialize, Deserialize)]
 struct Config {
     accounts: HashMap<String, Account>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CloudStateEntry {
+    cloud_id: String,
+    file_path: String,
+    last_modified: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CloudState {
+    entries: Vec<CloudStateEntry>,
 }
 
 pub fn urlencode(data: &str) -> String {
@@ -255,6 +261,20 @@ fn timestamp() -> u64 {
     start.duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
+fn find_cloudstate_entry<'a>(
+    cloudstate: &'a CloudState,
+    file_path: &'a str,
+) -> Option<(usize, &'a CloudStateEntry)> {
+    for i in 0..cloudstate.entries.len() {
+        let v = &cloudstate.entries[i];
+        if v.file_path.as_str() == file_path {
+            return Some((i, v));
+        }
+    }
+
+    None
+}
+
 fn sync_files(
     account: &mut Account,
     account_name: &str,
@@ -274,46 +294,26 @@ fn sync_files(
         account.attributes = HashMap::new();
     }
 
-    println!("INFO: Reading existing cloudlist");
+    println!("INFO: Reading cloudstate");
 
     // Creating a scope so file is closed
     // Before we update the last sync
     {
-        let cloudfiles_file_path = format!("{}/.cloudfiles", folder_to_sync);
-        let mut cloudfiles_file = std::fs::File::options()
+        let cloudstate_file_path = format!("{}/.cloudstate", folder_to_sync);
+        let mut cloudstate_file = std::fs::File::options()
             .read(true)
             .write(true)
             .create(true)
-            .open(cloudfiles_file_path)
+            .open(cloudstate_file_path)
             .map_err(|err| err.to_string())?;
 
-        let mut cloudfiles_file_contents = String::new();
-        cloudfiles_file
-            .read_to_string(&mut cloudfiles_file_contents)
-            .map_err(|err| err.to_string())?;
-
-        let mut cloudfiles = HashMap::new();
-
-        // Only read cloudfiles if we're not freshly syncing
-        if !sync_flags.fresh {
-            let cloudfiles_file_lines = cloudfiles_file_contents.lines();
-            for line in cloudfiles_file_lines {
-                let (last_modified_str, file_path) = match line.split_once(':') {
-                    Some(pair) => pair,
-                    None => {
-                        return Err(
-                            "Incorrect .cloudfile please resync this folder from start".to_string()
-                        )
-                    }
-                };
-
-                let last_modified: u64 = last_modified_str
-                    .parse()
-                    .map_err(|err| format!("Unknown config format {}", err))?;
-
-                cloudfiles.insert(file_path.to_string(), last_modified);
+        let mut cloudstate = if !sync_flags.fresh {
+            serde_json::from_reader(&cloudstate_file).unwrap()
+        } else {
+            CloudState {
+                entries: Vec::new(),
             }
-        }
+        };
 
         // Getting local changes
         let mut local_files = HashMap::new();
@@ -345,18 +345,18 @@ fn sync_files(
         };
 
         println!("INFO: Cloud Delta {}", deltas.len());
-        println!("INFO: Cloud files {}", cloudfiles.len());
+        println!("INFO: Cloud files {}", cloudstate.entries.len());
         println!("INFO: Local files {}", local_files.len());
 
         for delta in &deltas {
             // Skip the cloud sync cloud we have
             // already have this file from the last sync
-            if account.last_synced >= delta.file.last_modified {
+            if account.last_synced >= delta.last_modified {
                 continue;
             }
 
-            let (folder, _) = delta.file.file_path.rsplit_once("/").unwrap();
-            let file_path = delta.file.file_path.clone();
+            let (folder, _) = delta.file_path.rsplit_once("/").unwrap();
+            let file_path = delta.file_path.clone();
             let full_file_path = format!("{}{}", folder_to_sync, file_path);
             let local_modified = local_files.get(&full_file_path).map_or(0, |val| *val);
 
@@ -365,11 +365,15 @@ fn sync_files(
             let cloud_modified = if sync_flags.fresh {
                 timestamp()
             } else {
-                delta.file.last_modified
+                delta.last_modified
             };
+
+            let result = find_cloudstate_entry(&cloudstate, &file_path);
 
             match delta.delta_type {
                 DriveDeltaType::Deleted => {
+                    let (cloud_index, _) = result.unwrap();
+
                     if cloud_modified > local_modified {
                         println!("INFO: Deleting local file {}", full_file_path);
 
@@ -384,7 +388,7 @@ fn sync_files(
                         };
                     }
 
-                    cloudfiles.remove(&file_path);
+                    cloudstate.entries.remove(cloud_index);
                 }
                 DriveDeltaType::CreatedOrModifiled => {
                     if cloud_modified > local_modified {
@@ -405,7 +409,11 @@ fn sync_files(
                                     .map_err(|err| err.to_string())?;
 
                                 let ts = timestamp();
-                                cloudfiles.insert(file_path.clone(), ts);
+                                cloudstate.entries.push(CloudStateEntry {
+                                    cloud_id: delta.cloud_id.to_string(),
+                                    file_path: file_path.clone(),
+                                    last_modified: ts,
+                                });
                                 local_files.insert(full_file_path, ts);
                                 downloaded_count += 1;
                             }
@@ -415,7 +423,8 @@ fn sync_files(
                         };
                     } else {
                         // If recently modified we'll treat as new untracked file
-                        cloudfiles.remove(&file_path);
+                        let (cloud_index, _) = result.unwrap();
+                        cloudstate.entries.remove(cloud_index);
                     }
                 }
             }
@@ -423,12 +432,13 @@ fn sync_files(
 
         // Uploading locally modified files
         for (file_path, local_modified) in &local_files {
-            let drive_relative_path = file_path.split(folder_to_sync).last().unwrap();
-            let result = cloudfiles.get(drive_relative_path);
             let local_modified = *local_modified;
+            let drive_relative_path = file_path.split(folder_to_sync).last().unwrap();
+
+            let result = find_cloudstate_entry(&cloudstate, drive_relative_path);
             let is_file_modified = result.is_some()
                 && local_modified > account.last_synced
-                && local_modified > *(result.unwrap());
+                && local_modified > result.unwrap().1.last_modified;
 
             if is_file_modified || result.is_none() {
                 match std::fs::read(&file_path) {
@@ -445,8 +455,13 @@ fn sync_files(
                         };
 
                         match response {
-                            Ok(_) => {
-                                cloudfiles.insert(drive_relative_path.to_string(), timestamp());
+                            Ok(cloud_id) => {
+                                let ts = timestamp();
+                                cloudstate.entries.push(CloudStateEntry {
+                                    cloud_id,
+                                    file_path: drive_relative_path.to_string(),
+                                    last_modified: ts,
+                                });
                                 uploaded_count += 1;
                             }
                             Err(err) => {
@@ -463,21 +478,21 @@ fn sync_files(
 
         // Removing cloud files
         // IDK if we need to clone this
-        let cloudfiles_copy = cloudfiles.clone();
-        for (file_path, _) in &cloudfiles_copy {
-            let full_file_path = format!("{}{}", folder_to_sync, file_path);
-            if local_files.get(&full_file_path).is_none() {
-                println!("INFO: Cloud deleting file {}", file_path);
+        for i in 0..cloudstate.entries.len() {
+            let entry = &cloudstate.entries[i];
+            let full_file_path = format!("{}{}", folder_to_sync, entry.file_path);
 
-                let drive_relative_path = file_path.split(folder_to_sync).last().unwrap();
+            if local_files.get(&full_file_path).is_none() {
+                println!("INFO: Cloud deleting file {}", entry.file_path);
+
                 let response = match account.service {
                     SyncService::GDrive => todo!(),
-                    SyncService::Onedrive => onedrive::delete_file(&account, drive_relative_path),
+                    SyncService::Onedrive => onedrive::delete_file(&account, &entry.file_path),
                 };
 
                 match response {
                     Ok(_) => {
-                        cloudfiles.remove(drive_relative_path);
+                        cloudstate.entries.remove(i);
                         deleted_cloud_count += 1;
                     }
                     Err(err) => {
@@ -493,19 +508,12 @@ fn sync_files(
         println!("INFO: Deleted cloud {}", deleted_cloud_count);
 
         // Truncating the file
-        cloudfiles_file
+        cloudstate_file
             .set_len(0)
             .map_err(|err| format!("Cannot write to file: {}", err))?;
+        cloudstate_file.seek(std::io::SeekFrom::Start(0)).unwrap();
 
-        cloudfiles_file.seek(std::io::SeekFrom::Start(0)).unwrap();
-
-        // format timestamp:file_path
-        // Writing cloudfile to file
-        for (file_path, last_modified) in &cloudfiles {
-            if let Err(err) = writeln!(cloudfiles_file, "{}:{}", last_modified, file_path) {
-                return Err(format!("ERROR: Cannot save file in file list: {}", err));
-            }
-        }
+        serde_json::to_writer(cloudstate_file, &cloudstate).map_err(|err| err.to_string())?;
     }
 
     // Save changes to account
@@ -514,6 +522,7 @@ fn sync_files(
 
     Ok(())
 }
+
 // Assuming date 2023-08-06T13:23:00.093Z (ISO format)
 // @Returns unix timestamp
 fn parse_iso_date(date_time_str: &str) -> u64 {
