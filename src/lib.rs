@@ -55,13 +55,12 @@ struct Config {
 #[derive(Serialize, Deserialize)]
 struct CloudStateEntry {
     cloud_id: String,
-    file_path: String,
     last_modified: u64,
 }
 
 #[derive(Serialize, Deserialize)]
 struct CloudState {
-    entries: Vec<CloudStateEntry>,
+    entries: HashMap<String, CloudStateEntry>,
 }
 
 pub fn urlencode(data: &str) -> String {
@@ -258,20 +257,6 @@ fn timestamp() -> u64 {
     start.duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-fn find_cloudstate_entry<'a>(
-    cloudstate: &'a CloudState,
-    file_path: &'a str,
-) -> Option<(usize, &'a CloudStateEntry)> {
-    for i in 0..cloudstate.entries.len() {
-        let v = &cloudstate.entries[i];
-        if v.file_path.as_str() == file_path {
-            return Some((i, v));
-        }
-    }
-
-    None
-}
-
 fn sync_files(
     account: &mut Account,
     account_name: &str,
@@ -291,11 +276,29 @@ fn sync_files(
         account.attributes = HashMap::new();
     }
 
-    println!("INFO: Reading cloudstate");
+    // Getting local changes
+    let mut local_files = HashMap::new();
+    read_dir_rec(folder_to_sync, &mut local_files)
+        .map_err(|err| format!("Cannot walk folder to sync: {}", err))?;
+
+    // Deleting local files incase of
+    // fresh sync
+    if sync_flags.fresh {
+        println!("INFO: Cleaning up local files {}", local_files.len());
+
+        for file_path in local_files.keys() {
+            std::fs::remove_file(file_path)
+                .map_err(|err| format!("Cannot remove file: {}", err))?;
+        }
+
+        local_files = HashMap::new();
+    }
 
     // Creating a scope so file is closed
     // Before we update the last sync
     {
+        println!("INFO: Reading cloudstate");
+
         let cloudstate_file_path = format!("{}/.cloudstate", folder_to_sync);
         let mut cloudstate_file = std::fs::File::options()
             .read(true)
@@ -308,32 +311,14 @@ fn sync_files(
             match serde_json::from_reader(&cloudstate_file) {
                 Ok(state) => state,
                 Err(_) => CloudState {
-                    entries: Vec::new(),
+                    entries: HashMap::new(),
                 },
             }
         } else {
             CloudState {
-                entries: Vec::new(),
+                entries: HashMap::new(),
             }
         };
-
-        // Getting local changes
-        let mut local_files = HashMap::new();
-        read_dir_rec(folder_to_sync, &mut local_files)
-            .map_err(|err| format!("Cannot walk folder to sync: {}", err))?;
-
-        // Deleting local files incase of
-        // fresh sync
-        if sync_flags.fresh {
-            println!("INFO: Cleaning up local files {}", local_files.len());
-
-            for file_path in local_files.keys() {
-                std::fs::remove_file(file_path)
-                    .map_err(|err| format!("Cannot remove file: {}", err))?;
-            }
-
-            local_files = HashMap::new();
-        }
 
         // Getting cloud changes
         let deltas = match account.service {
@@ -365,25 +350,21 @@ fn sync_files(
                 delta.last_modified
             };
 
-            let result = find_cloudstate_entry(&cloudstate, &file_path);
-
             match delta.delta_type {
                 DriveDeltaType::Deleted => {
-                    if let Some((cloud_index, _)) = result {
-                        if cloud_modified > local_modified {
-                            println!("INFO: Deleting local file {}", full_file_path);
+                    if cloud_modified > local_modified {
+                        println!("INFO: Deleting local file {}", full_file_path);
 
-                            match std::fs::remove_file(&full_file_path) {
-                                Ok(_) => {
-                                    local_files.remove(&full_file_path);
-                                }
-                                Err(err) => {
-                                    println!("ERROR: Cannot remove file: {}", err)
-                                }
-                            };
-                        }
+                        match std::fs::remove_file(&full_file_path) {
+                            Ok(_) => {
+                                local_files.remove(&full_file_path);
+                            }
+                            Err(err) => {
+                                println!("ERROR: Cannot remove file: {}", err)
+                            }
+                        };
 
-                        cloudstate.entries.remove(cloud_index);
+                        cloudstate.entries.remove(&file_path);
                     }
                 }
                 DriveDeltaType::CreatedOrModifiled => {
@@ -405,11 +386,13 @@ fn sync_files(
                                     .map_err(|err| err.to_string())?;
 
                                 let ts = timestamp();
-                                cloudstate.entries.push(CloudStateEntry {
-                                    cloud_id: delta.cloud_id.to_string(),
-                                    file_path: file_path.clone(),
-                                    last_modified: ts,
-                                });
+                                cloudstate.entries.insert(
+                                    file_path,
+                                    CloudStateEntry {
+                                        cloud_id: delta.cloud_id.to_string(),
+                                        last_modified: ts,
+                                    },
+                                );
                                 local_files.insert(full_file_path, ts);
                             }
                             Err(err) => {
@@ -417,10 +400,7 @@ fn sync_files(
                             }
                         };
                     } else {
-                        // If recently modified we'll treat as new untracked file
-                        if let Some((cloud_index, _)) = result {
-                            cloudstate.entries.remove(cloud_index);
-                        }
+                        cloudstate.entries.remove(&file_path);
                     }
                 }
             }
@@ -431,10 +411,10 @@ fn sync_files(
             let local_modified = *local_modified;
             let drive_relative_path = file_path.split(folder_to_sync).last().unwrap();
 
-            let result = find_cloudstate_entry(&cloudstate, drive_relative_path);
+            let result = cloudstate.entries.get(drive_relative_path);
             let is_file_modified = result.is_some()
                 && local_modified > account.last_synced
-                && local_modified > result.unwrap().1.last_modified;
+                && local_modified > result.unwrap().last_modified;
 
             if is_file_modified || result.is_none() {
                 match std::fs::read(file_path) {
@@ -453,11 +433,13 @@ fn sync_files(
                         match response {
                             Ok(cloud_id) => {
                                 let ts = timestamp();
-                                cloudstate.entries.push(CloudStateEntry {
-                                    cloud_id,
-                                    file_path: drive_relative_path.to_string(),
-                                    last_modified: ts,
-                                });
+                                cloudstate.entries.insert(
+                                    drive_relative_path.to_string(),
+                                    CloudStateEntry {
+                                        cloud_id,
+                                        last_modified: ts,
+                                    },
+                                );
                             }
                             Err(err) => {
                                 println!("ERROR: Uploading file: {}", err);
@@ -473,30 +455,32 @@ fn sync_files(
 
         // Removing cloud files
         let mut cloudfiles_to_deleted = Vec::new();
-        for i in 0..cloudstate.entries.len() {
-            let entry = &cloudstate.entries[i];
-            let full_file_path = format!("{}{}", folder_to_sync, entry.file_path);
+        {
+            for file_path in cloudstate.entries.keys() {
+                let entry = &cloudstate.entries.get(file_path).unwrap();
+                let full_file_path = format!("{}{}", folder_to_sync, file_path);
 
-            if local_files.get(&full_file_path).is_none() {
-                println!("INFO: Cloud deleting file {}", entry.file_path);
+                if local_files.get(&full_file_path).is_none() {
+                    println!("INFO: Cloud deleting file {}", file_path);
 
-                let response = match account.service {
-                    SyncService::GDrive => todo!(),
-                    SyncService::Onedrive => onedrive::delete_file(account, &entry.cloud_id),
-                };
+                    let response = match account.service {
+                        SyncService::GDrive => todo!(),
+                        SyncService::Onedrive => onedrive::delete_file(account, &entry.cloud_id),
+                    };
 
-                match response {
-                    Ok(_) => {}
-                    Err(err) => {
-                        println!("ERROR: Cloud deleting file: {}", err);
-                    }
-                };
-                cloudfiles_to_deleted.push(i);
+                    match response {
+                        Ok(_) => {}
+                        Err(err) => {
+                            println!("ERROR: Cloud deleting file: {}", err);
+                        }
+                    };
+                    cloudfiles_to_deleted.push(file_path.clone());
+                }
             }
         }
 
-        for entry_index in cloudfiles_to_deleted {
-            cloudstate.entries.remove(entry_index);
+        for file_path in cloudfiles_to_deleted {
+            cloudstate.entries.remove(&file_path);
         }
 
         // Truncating the file

@@ -233,6 +233,10 @@ pub fn get_drive_delta(account: &mut Account) -> Result<Vec<DriveDelta>, String>
         }
 
         let file_name = file.name.unwrap();
+        if file_name.is_empty() {
+            continue;
+        }
+
         let file_path = if let Some(mut parent) = file.parentReference.path {
             let folder = parent.split_off(12);
             format!("{}/{}", folder, file_name)
