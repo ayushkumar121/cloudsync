@@ -189,6 +189,7 @@ fn save_account(account_name: &str, account: &Account) -> Result<(), String> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(true)
         .open(config_path)
         .map_err(|err| format!("Cannot create config file: {}", err))?;
 
